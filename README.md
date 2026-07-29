@@ -1,41 +1,136 @@
 # am — Alias Manager
 
-`am` is a small Rust CLI that manages personal bash aliases in a single
-dedicated file, `~/.alias-management`. It never touches aliases defined
-anywhere else — the only other file it writes is `~/.bash_profile`, once,
-during initial setup.
+`am` is a small command-line tool (a single Rust binary) that manages your
+personal bash aliases in one dedicated file, `~/.alias-management`. It works
+on **Linux and macOS** with bash. It never touches aliases defined anywhere
+else — the only other file it writes is `~/.bash_profile`, once, during
+initial setup.
 
 ```
 $ am
-┌─────────┬───────┬────────────────────────┐
-│ type    ┆ alias ┆ action                 │
-╞═════════╪═══════╪════════════════════════╡
-│ command ┆ gp    ┆ git pull               │
-│ folder  ┆ p     ┆ cd ~/folder/personal   │
-└─────────┴───────┴────────────────────────┘
+┌─────────┬───────┬──────────────────────┐
+│ type    ┆ alias ┆ action               │
+╞═════════╪═══════╪══════════════════════╡
+│ command ┆ gp    ┆ git pull             │
+│ folder  ┆ p     ┆ cd ~/folder/personal │
+│ ssh     ┆ srv   ┆ ssh forge@127.0.0.1  │
+└─────────┴───────┴──────────────────────┘
 ```
+
+It manages three kinds of aliases:
+
+| type | what it does | example |
+|---|---|---|
+| `command` | run any shell command | `gp` → `git pull` |
+| `folder` | jump to a directory | `p` → `cd ~/folder/personal` |
+| `ssh` | connect to a server | `srv` → `ssh forge@127.0.0.1` |
 
 ## Install
 
+### Option 1 — just download the `am` file and put it in your bin folder
+
+`am` is a single self-contained executable — no runtime, no libraries, no
+config. To use it system-wide, all you need to do is download the `am`
+binary built for your platform and drop it into a folder on your `PATH`:
+
 ```bash
+# system-wide (needs sudo)
+sudo cp am /usr/local/bin/ && sudo chmod +x /usr/local/bin/am
+
+# or user-only (make sure the folder is on your PATH)
+mkdir -p ~/.local/bin && cp am ~/.local/bin/ && chmod +x ~/.local/bin/am
+```
+
+The binary must match your OS and CPU: use a Linux build on Linux and a
+macOS build on a Mac (and mind x86_64 vs arm64). On macOS, if Gatekeeper
+blocks a downloaded binary, clear the quarantine flag with
+`xattr -d com.apple.quarantine /usr/local/bin/am`.
+
+### Option 2 — build from source
+
+With Rust 1.85+ installed:
+
+```bash
+cargo build --release                    # produces target/release/am
+sudo cp target/release/am /usr/local/bin/
+# or, if ~/.cargo/bin is on your PATH:
 cargo install --path .
 ```
 
-Then run `am` once. The first run performs setup:
+### First run
+
+Run `am` once after installing. It sets everything up:
 
 1. Creates `~/.alias-management` if it does not exist.
-2. Ensures the shell-integration block (below) is present in
-   `~/.bash_profile`, creating the file if needed. The block is
-   marker-delimited and appended exactly once — re-running `am` never
-   duplicates it.
+2. Adds the shell-integration block (see below) to `~/.bash_profile`,
+   creating the file if needed — exactly once, never duplicated.
 
-Finally, restart your shell or run `source ~/.bash_profile`.
+Then restart your terminal or run `source ~/.bash_profile`.
 
-## Shell integration
+## How to use
 
-A Rust binary runs in a child process, so it cannot `source` a file into
-your running shell. Instead, setup installs this block into
-`~/.bash_profile`:
+### See your aliases
+
+```bash
+am
+```
+
+Prints the table shown above: `type | alias | action`, grouped by type
+(commands, then folders, then ssh), alphabetical within each group.
+
+### Create an alias
+
+```bash
+am new
+```
+
+Everything is asked interactively:
+
+1. **Type** — pick `command`, `folder` or `ssh`.
+2. **Alias name** — refused if the name is already taken, either by am or
+   by anything else on your system (binaries, builtins, functions, other
+   aliases), so an existing command is never shadowed.
+3. **The details**, depending on the type:
+   - *command*: the command to run, e.g. `git pull`.
+   - *folder*: the folder path — defaults to the directory you are
+     standing in, so `cd` into the folder first and just press Enter.
+   - *ssh*: the user and the host. User `forge` and host `127.0.0.1`
+     become the command `ssh forge@127.0.0.1`.
+
+The alias is appended to `~/.alias-management` and — thanks to the shell
+integration — works in the current shell immediately.
+
+### Delete an alias
+
+```bash
+am delete          # pick from a list
+am delete gp       # delete by name
+```
+
+Either way, `am` asks first — **No is the default**, so a stray Enter never
+deletes anything:
+
+```
+? Do you want to delete command 'gp'? (y/n) › no
+```
+
+For scripts and other non-interactive use, skip the prompt with
+`am delete gp --yes` (or `-y`). Deleting removes only that alias's line
+from `~/.alias-management`; everything else in the file stays untouched.
+
+### Help
+
+```bash
+am --help
+am new --help
+am delete --help
+```
+
+## How the shell integration works
+
+A child process cannot change the shell that launched it, so the `am`
+binary alone could never make a new alias appear in your open terminal.
+Setup therefore installs this block into `~/.bash_profile`:
 
 ```bash
 # >>> alias-management (am) >>>
@@ -54,60 +149,53 @@ am() {
 # <<< alias-management (am) <<<
 ```
 
-It does two things:
-
-- sources `~/.alias-management` when the shell starts, and
-- wraps `am` in a shell function: every `am` invocation runs the real
-  binary (`command am`), then immediately re-sources
-  `~/.alias-management` in the **active** shell — so an alias created
-  with `am new` works right away, no new terminal needed.
+It sources your aliases when the shell starts, and wraps `am` in a function
+that re-sources them right after every `am` command — that is what makes
+`am new` take effect instantly.
 
 If `am` has to create `~/.bash_profile` from scratch, it also adds a line
-sourcing `~/.profile` first. bash reads only the first of
-`~/.bash_profile` / `~/.bash_login` / `~/.profile` for login shells, so
-without that line a brand-new `~/.bash_profile` would silently disable an
-existing `~/.profile` (and any PATH setup in it).
+sourcing `~/.profile` first: bash reads only the first of `~/.bash_profile`
+/ `~/.bash_login` / `~/.profile` for login shells, and without that line a
+brand-new `~/.bash_profile` would silently disable an existing `~/.profile`
+(and any PATH setup living there).
 
 ## Storage format
 
-Aliases are stored as standard bash, one per line, with a required
-trailing comment marking the type:
+Plain bash, one alias per line, with a required trailing comment marking
+the type:
 
 ```bash
 alias gp="git pull" #command
 alias p="cd ~/folder/personal" #folder
+alias srv="ssh forge@127.0.0.1" #ssh
 ```
 
 Anything else in the file — comments, blank lines, hand-written bash,
-alias lines without a `#command`/`#folder` marker — is ignored and
-preserved verbatim. Only marked lines are managed.
+alias lines without a type marker — is ignored and preserved verbatim.
+Because it is just bash, you can edit the file by hand too; `am` picks the
+changes up on the next run.
 
-## Commands
+## Linux and macOS notes
 
-| Command | What it does |
-|---|---|
-| `am` | Lists managed aliases in a table (`type \| alias \| action`), grouped by type, alphabetical within each group. |
-| `am new` | Interactive creation. Asks command vs. folder, then name and action. Folder paths default to the current working directory. |
-| `am delete [NAME]` | Deletes a managed alias. With `NAME` it is scriptable; without, it shows a picker. Only the matching line is removed. |
-| `am --help` | Full help; `am new --help` and `am delete --help` for details. |
-
-Before saving, `am new` verifies the name is free **system-wide** by
-probing a login shell (`bash -lic 'command -v -- "$1"'`), so it refuses to
-shadow existing binaries, builtins, functions, or aliases — including the
-ones it manages and `am` itself.
+- **macOS**: Terminal.app and iTerm2 start *login* shells, so
+  `~/.bash_profile` (and with it your aliases) loads automatically. The
+  default shell on modern macOS is zsh; `am` targets bash — switch with
+  `chsh -s /bin/bash`, or start `bash` inside your session.
+- **Linux**: many desktop terminals start *non-login* shells, which skip
+  `~/.bash_profile`. If your aliases only show up after `bash -l`, add
+  `source ~/.bash_profile` to your `~/.bashrc` (am deliberately never
+  edits `~/.bashrc` itself).
 
 ## Behavior notes and limitations
 
-- **bash only.** The integration targets `~/.bash_profile` by design.
-  `~/.bash_profile` is read by *login* shells; if your terminal opens
-  non-login shells, add `source ~/.bash_profile` to `~/.bashrc` yourself
-  (am deliberately never edits `~/.bashrc`).
-- **Deleting an alias cannot un-define it in shells where it is already
-  loaded** — sourcing only adds or overwrites definitions. `am delete`
+- Deleting an alias cannot un-define it in shells where it is already
+  loaded — sourcing only adds or overwrites definitions. `am delete`
   prints a reminder; run `unalias NAME` in open shells or start a new one.
 - Writes are atomic (temp file + rename), so a crash can never truncate
   `~/.alias-management` or `~/.bash_profile`.
 - Actions containing **both** single and double quotes cannot be stored as
   a plain bash alias line and are rejected with an explanation. Folder
-  paths with spaces are stored quoted (`alias p='cd "/a/My Dir"' #folder`);
-  paths containing quotes, `$`, backticks, or backslashes are rejected.
+  paths with spaces are stored quoted; paths containing quotes, `$`,
+  backticks, or backslashes are rejected. SSH users and hosts accept the
+  usual safe characters (letters, digits, `.`, `_`, `-`, plus `:` for
+  IPv6 hosts).
