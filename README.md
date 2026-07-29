@@ -7,7 +7,7 @@ else — the only other file it writes is `~/.bash_profile`, once, during
 initial setup.
 
 ```
-$ am
+$ am list
 ┌─────────┬───────┬──────────────────────┐
 │ type    ┆ alias ┆ action               │
 ╞═════════╪═══════╪══════════════════════╡
@@ -84,11 +84,16 @@ Then restart your terminal or run `source ~/.bash_profile`.
 ### See your aliases
 
 ```bash
-am
+am list                # everything
+am list -c             # only commands (-f folders, -s ssh; combine freely)
+am list --search git   # aliases with 'git' in the name or in the action
 ```
 
 Prints the table shown above: `type | alias | action`, grouped by type
 (commands, then folders, then ssh), alphabetical within each group.
+`--search` is case-insensitive and looks in the alias name *and* the
+action, so it matches folder paths, command lines and ssh targets alike.
+Running bare `am` shows the help.
 
 ### Create an alias
 
@@ -111,6 +116,25 @@ Everything is asked interactively:
 
 The alias is appended to `~/.alias-management` and — thanks to the shell
 integration — works in the current shell immediately.
+
+**In a hurry?** Give any part up front with `-f` (folder), `-c` (command)
+or `-s` (ssh) — am only asks for what is missing:
+
+```bash
+am new -f                        # folder alias for the current directory, asks the name
+am new -f here                   # folder alias 'here' for the current directory
+am new -c                        # command alias, asks name and command
+am new -c gp                     # command alias 'gp', asks the command
+am new -c gp 'git pull'          # command alias, no prompts
+am new -s                        # ssh alias, asks name, user and host
+am new -s srv                    # ssh alias 'srv', asks user and host
+am new -s srv forge              # ssh alias 'srv', user 'forge', asks the host
+am new -s srv forge 127.0.0.1    # ssh alias, no prompts
+am new -s srv forge@127.0.0.1    # same thing, user@host form
+```
+
+Forms with nothing left to ask (like `am new -c gp 'git pull'`) also work
+without a terminal, so they are script-friendly.
 
 ### Delete an alias
 
@@ -146,7 +170,8 @@ set up the shell integration.
 ### Help
 
 ```bash
-am --help
+am --help          # bare `am` shows the same help
+am list --help
 am new --help
 am delete --help
 am install --help
