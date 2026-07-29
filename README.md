@@ -31,7 +31,18 @@ It manages three kinds of aliases:
 
 `am` is a single self-contained executable — no runtime, no libraries, no
 config. To use it system-wide, all you need to do is download the `am`
-binary built for your platform and drop it into a folder on your `PATH`:
+binary built for your platform and put it in a folder on your `PATH`. The
+easiest way is to let it install itself:
+
+```bash
+chmod +x am        # make the downloaded file executable
+./am install       # copies it to /usr/local/bin (or ~/.local/bin without root)
+```
+
+`sudo ./am install` forces the system-wide folder, and `./am install ~/bin`
+installs into a folder of your choice — am tells you if that folder is not
+on your PATH and exactly which line to add. Doing it by hand works just as
+well:
 
 ```bash
 # system-wide (needs sudo)
@@ -52,14 +63,15 @@ With Rust 1.85+ installed:
 
 ```bash
 cargo build --release                    # produces target/release/am
-sudo cp target/release/am /usr/local/bin/
+./target/release/am install              # copies it onto your PATH
 # or, if ~/.cargo/bin is on your PATH:
 cargo install --path .
 ```
 
 ### First run
 
-Run `am` once after installing. It sets everything up:
+`am install` only places the binary. Run `am` once afterwards — that first
+run sets everything up:
 
 1. Creates `~/.alias-management` if it does not exist.
 2. Adds the shell-integration block (see below) to `~/.bash_profile`,
@@ -118,12 +130,26 @@ For scripts and other non-interactive use, skip the prompt with
 `am delete gp --yes` (or `-y`). Deleting removes only that alias's line
 from `~/.alias-management`; everything else in the file stays untouched.
 
+### Install or update the binary
+
+```bash
+am install         # copy this binary to /usr/local/bin (or ~/.local/bin)
+sudo am install    # force the system-wide folder
+am install ~/bin   # or pick any folder
+```
+
+Handy after building from source or downloading a newer version: the
+running `am` copies itself into place atomically. `am install` never
+touches your dotfiles (safe under sudo) — run any other am command once to
+set up the shell integration.
+
 ### Help
 
 ```bash
 am --help
 am new --help
 am delete --help
+am install --help
 ```
 
 ## How the shell integration works
