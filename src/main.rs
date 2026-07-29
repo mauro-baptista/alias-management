@@ -1,10 +1,10 @@
 //! `am` — a manager for personal bash aliases.
 //!
 //! Aliases live in `~/.alias-management` (plain bash, one alias per line with
-//! a trailing `#command` / `#folder` marker). A marker-delimited block in
-//! `~/.bash_profile` sources that file and wraps `am` in a shell function that
-//! re-sources it after every run, so changes apply to the active shell
-//! immediately.
+//! a trailing `#command` / `#folder` / `#ssh` marker). A marker-delimited
+//! block in `~/.bash_profile` sources that file and wraps `am` in a shell
+//! function that re-sources it after every run, so changes apply to the
+//! active shell immediately.
 
 use std::env;
 use std::fs;
@@ -33,6 +33,7 @@ const ALIAS_FILE_HEADER: &str = "\
 # Lines of the form
 #   alias <name>=\"<action>\" #command
 #   alias <name>=\"<action>\" #folder
+#   alias <name>=\"<action>\" #ssh
 # are owned by am. Anything else in this file is left untouched.
 ";
 
@@ -74,7 +75,7 @@ const PROFILE_CREATE_PREAMBLE: &str = "\
 /// treated as unmanaged content and preserved verbatim.
 static ALIAS_LINE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"^\s*alias\s+([A-Za-z0-9_][A-Za-z0-9_.-]*)=(?:"([^"]*)"|'([^']*)')\s*#\s*(command|folder)\s*$"#,
+        r#"^\s*alias\s+([A-Za-z0-9_][A-Za-z0-9_.-]*)=(?:"([^"]*)"|'([^']*)')\s*#\s*(command|folder|ssh)\s*$"#,
     )
     .expect("alias line regex is valid")
 });
@@ -103,13 +104,15 @@ re-sources the file after every `am` command, so aliases created with \
 `am new` work in the current shell immediately.\n\n\
 Aliases are stored as plain bash with a trailing type marker:\n    \
 alias gp=\"git pull\" #command\n    \
-alias p=\"cd ~/folder/personal\" #folder\n\n\
+alias p=\"cd ~/folder/personal\" #folder\n    \
+alias srv=\"ssh forge@127.0.0.1\" #ssh\n\n\
 Run `am` with no arguments to list everything it manages.",
     after_help = "Examples:\n  \
-am              List managed aliases in a table\n  \
-am new          Interactively create a new alias\n  \
-am delete gp    Delete the managed alias named 'gp'\n  \
-am delete       Pick a managed alias to delete from a list\n\n\
+am                 List managed aliases in a table\n  \
+am new             Interactively create a new alias\n  \
+am delete gp       Delete 'gp' after a confirmation prompt\n  \
+am delete gp -y    Delete 'gp' without asking\n  \
+am delete          Pick a managed alias to delete from a list\n\n\
 Files:\n  \
 ~/.alias-management   Managed alias definitions (sourced by bash)\n  \
 ~/.bash_profile       Receives the am shell-integration block on first run"
@@ -124,20 +127,24 @@ enum Cmd {
     #[command(
         about = "Create a new alias interactively",
         long_about = "Create a new alias interactively.\n\n\
-Asks whether the alias is for a command or a folder, then prompts for the \
-alias name and the command text (or folder path, defaulting to the current \
-directory). Before saving, the name is checked against aliases already \
-managed here and against everything visible in a login shell (binaries, \
-builtins, functions and existing aliases), so an existing name is never \
-shadowed. The new alias is appended to ~/.alias-management."
+Asks whether the alias is for a command, a folder or an ssh connection, then \
+prompts for the alias name and the details: the command text, the folder \
+path (defaulting to the current directory), or the ssh user and host (user \
+'forge' and host '127.0.0.1' are stored as `ssh forge@127.0.0.1`). Before \
+saving, the name is checked against aliases already managed here and \
+against everything visible in a login shell (binaries, builtins, functions \
+and existing aliases), so an existing name is never shadowed. The new alias \
+is appended to ~/.alias-management."
     )]
     New,
     #[command(
         about = "Delete a managed alias",
         long_about = "Delete a managed alias.\n\n\
 With NAME, deletes that alias from ~/.alias-management. Without NAME, shows \
-a list of managed aliases to pick from. Only the matching managed line is \
-removed; every other line in the file is preserved exactly.\n\n\
+a list of managed aliases to pick from. Either way you are asked to confirm \
+first (No is the default); pass --yes to skip the prompt, e.g. in scripts. \
+Only the matching managed line is removed; every other line in the file is \
+preserved exactly.\n\n\
 Note: an alias already loaded in an open shell stays active there until you \
 run `unalias NAME` or start a new shell."
     )]
@@ -147,6 +154,8 @@ run `unalias NAME` or start a new shell."
             help = "Name of the managed alias to delete (omit to pick interactively)"
         )]
         name: Option<String>,
+        #[arg(short = 'y', long = "yes", help = "Skip the confirmation prompt")]
+        yes: bool,
     },
 }
 
@@ -154,12 +163,13 @@ run `unalias NAME` or start a new shell."
 // Domain types
 // ---------------------------------------------------------------------------
 
-// Declaration order gives Command < Folder, which is also alphabetical:
-// the command group sorts first in listings.
+// Declaration order gives Command < Folder < Ssh, which is also
+// alphabetical: listings group commands first, then folders, then ssh.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum AliasKind {
     Command,
     Folder,
+    Ssh,
 }
 
 impl AliasKind {
@@ -167,6 +177,7 @@ impl AliasKind {
         match self {
             AliasKind::Command => "command",
             AliasKind::Folder => "folder",
+            AliasKind::Ssh => "ssh",
         }
     }
 
@@ -174,6 +185,7 @@ impl AliasKind {
         match s {
             "command" => Some(AliasKind::Command),
             "folder" => Some(AliasKind::Folder),
+            "ssh" => Some(AliasKind::Ssh),
             _ => None,
         }
     }
@@ -205,7 +217,7 @@ fn run(cli: Cli) -> Result<()> {
     match cli.command {
         None => cmd_list(&alias_path),
         Some(Cmd::New) => cmd_new(&home, &alias_path),
-        Some(Cmd::Delete { name }) => cmd_delete(&alias_path, name),
+        Some(Cmd::Delete { name, yes }) => cmd_delete(&alias_path, name, yes),
     }
 }
 
@@ -363,8 +375,8 @@ fn remove_entry_lines(content: &str, name: &str) -> (String, usize) {
     (out, removed)
 }
 
-/// Command group first, then folders; case-insensitive alphabetical by alias
-/// name within each group.
+/// Command group first, then folders, then ssh; case-insensitive
+/// alphabetical by alias name within each group.
 fn sort_for_display(entries: &mut [AliasEntry]) {
     entries.sort_by(|a, b| {
         a.kind
@@ -417,6 +429,59 @@ fn folder_action(expanded: &Path, home: &Path) -> Result<String> {
         );
     }
     Ok(format!("cd \"{absolute}\""))
+}
+
+// ---------------------------------------------------------------------------
+// SSH helpers
+// ---------------------------------------------------------------------------
+
+/// Build the action for an ssh alias: `ssh <user>@<host>`.
+fn ssh_action(user: &str, host: &str) -> String {
+    format!("ssh {}@{}", user.trim(), host.trim())
+}
+
+/// SSH user names: start with a letter, digit or '_', then letters, digits,
+/// '.', '_' and '-'. The leading-character rule also guarantees the stored
+/// `ssh <user>@<host>` argument can never look like an ssh option.
+fn validate_ssh_user(user: &str) -> Result<(), String> {
+    let trimmed = user.trim();
+    if trimmed.is_empty() {
+        return Err("the ssh user cannot be empty".into());
+    }
+    let first_ok = trimmed
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+    let rest_ok = trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c));
+    if !first_ok || !rest_ok {
+        return Err(
+            "the ssh user must start with a letter, digit or '_' and may only \
+                    contain letters, digits, '.', '_' and '-'"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// Hostnames, IPv4 or IPv6 addresses: letters, digits, '.', ':', '_' and '-'.
+fn validate_ssh_host(host: &str) -> Result<(), String> {
+    let trimmed = host.trim();
+    if trimmed.is_empty() {
+        return Err("the host cannot be empty".into());
+    }
+    if !trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || ".:_-".contains(c))
+    {
+        return Err(
+            "the host may only contain letters, digits, '.', ':', '_' and '-' \
+                    (a hostname, IPv4 or IPv6 address)"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -518,8 +583,8 @@ fn cmd_new(home: &Path, alias_path: &Path) -> Result<()> {
 
     let Some(kind_idx) = as_cancel(
         Select::with_theme(&theme)
-            .with_prompt("Create an alias for a command or a folder?")
-            .items(["command", "folder"])
+            .with_prompt("Create an alias for a command, a folder or an ssh connection?")
+            .items(["command", "folder", "ssh"])
             .default(0)
             .interact_opt(),
     )?
@@ -527,10 +592,10 @@ fn cmd_new(home: &Path, alias_path: &Path) -> Result<()> {
         println!("Cancelled.");
         return Ok(());
     };
-    let kind = if kind_idx == 0 {
-        AliasKind::Command
-    } else {
-        AliasKind::Folder
+    let kind = match kind_idx {
+        0 => AliasKind::Command,
+        1 => AliasKind::Folder,
+        _ => AliasKind::Ssh,
     };
 
     let existing = load_entries(alias_path)?;
@@ -625,6 +690,29 @@ fn cmd_new(home: &Path, alias_path: &Path) -> Result<()> {
                 break folder_action(&expanded, home)?;
             }
         }
+        AliasKind::Ssh => {
+            let Some(user) = as_cancel(
+                Input::<String>::with_theme(&theme)
+                    .with_prompt("SSH user")
+                    .validate_with(|value: &String| validate_ssh_user(value))
+                    .interact_text(),
+            )?
+            else {
+                println!("Cancelled.");
+                return Ok(());
+            };
+            let Some(host) = as_cancel(
+                Input::<String>::with_theme(&theme)
+                    .with_prompt("Host")
+                    .validate_with(|value: &String| validate_ssh_host(value))
+                    .interact_text(),
+            )?
+            else {
+                println!("Cancelled.");
+                return Ok(());
+            };
+            ssh_action(&user, &host)
+        }
     };
 
     let entry = AliasEntry { name, action, kind };
@@ -637,12 +725,15 @@ fn cmd_new(home: &Path, alias_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn cmd_delete(alias_path: &Path, name: Option<String>) -> Result<()> {
-    let name = match name {
-        Some(name) => name,
+fn cmd_delete(alias_path: &Path, name: Option<String>, yes: bool) -> Result<()> {
+    let mut entries = load_entries(alias_path)?;
+    let target = match name {
+        Some(name) => match entries.iter().find(|e| e.name == name) {
+            Some(entry) => entry.clone(),
+            None => bail!("'{name}' is not managed by am (run `am` to see managed aliases)"),
+        },
         None => {
             ensure_interactive()?;
-            let mut entries = load_entries(alias_path)?;
             if entries.is_empty() {
                 println!("No managed aliases to delete. Run `am new` to create one.");
                 return Ok(());
@@ -663,20 +754,46 @@ fn cmd_delete(alias_path: &Path, name: Option<String>) -> Result<()> {
                 println!("Cancelled.");
                 return Ok(());
             };
-            entries[index].name.clone()
+            entries[index].clone()
         }
     };
 
+    if !yes {
+        if !std::io::stdin().is_terminal() {
+            bail!("deleting needs confirmation; re-run with --yes to skip the prompt in scripts");
+        }
+        let confirmed = as_cancel(
+            Confirm::with_theme(&ColorfulTheme::default())
+                .with_prompt(format!(
+                    "Do you want to delete {} '{}'?",
+                    target.kind.as_str(),
+                    target.name
+                ))
+                .default(false)
+                .interact_opt(),
+        )?
+        .flatten()
+        .unwrap_or(false);
+        if !confirmed {
+            println!("Not deleted.");
+            return Ok(());
+        }
+    }
+
     let content = fs::read_to_string(alias_path)
         .with_context(|| format!("failed to read {}", alias_path.display()))?;
-    let (updated, removed) = remove_entry_lines(&content, &name);
+    let (updated, removed) = remove_entry_lines(&content, &target.name);
     if removed == 0 {
-        bail!("'{name}' is not managed by am (run `am` to see managed aliases)");
+        bail!(
+            "'{}' is not managed by am (run `am` to see managed aliases)",
+            target.name
+        );
     }
     write_atomic(alias_path, &updated)?;
-    println!("Deleted alias '{name}' from ~/{ALIAS_FILE_NAME}.");
+    println!("Deleted alias '{}' from ~/{ALIAS_FILE_NAME}.", target.name);
     println!(
-        "Note: if '{name}' is active in an open shell, run `unalias {name}` there or start a new shell."
+        "Note: if '{0}' is active in an open shell, run `unalias {0}` there or start a new shell.",
+        target.name
     );
     Ok(())
 }
@@ -730,6 +847,10 @@ mod tests {
         assert_eq!(
             parse_alias_line(r#"alias p="cd ~/folder/personal" #folder"#),
             Some(entry("p", "cd ~/folder/personal", AliasKind::Folder))
+        );
+        assert_eq!(
+            parse_alias_line(r#"alias srv="ssh forge@127.0.0.1" #ssh"#),
+            Some(entry("srv", "ssh forge@127.0.0.1", AliasKind::Ssh))
         );
     }
 
@@ -819,6 +940,7 @@ mod tests {
             entry("gc", r#"git commit -m "wip""#, AliasKind::Command),
             entry("p", "cd ~/folder/personal", AliasKind::Folder),
             entry("s", r#"cd "/home/u/My Dir""#, AliasKind::Folder),
+            entry("srv", "ssh forge@127.0.0.1", AliasKind::Ssh),
         ];
         for original in cases {
             let line = format_alias_line(&original).unwrap();
@@ -953,16 +1075,18 @@ mod tests {
     // -- sorting and table --
 
     #[test]
-    fn sort_groups_commands_first_then_alpha() {
+    fn sort_groups_commands_then_folders_then_ssh() {
         let mut entries = vec![
+            entry("s2", "ssh b@h", AliasKind::Ssh),
             entry("z", "cd ~/z", AliasKind::Folder),
             entry("B", "echo b", AliasKind::Command),
+            entry("s1", "ssh a@h", AliasKind::Ssh),
             entry("a", "cd ~/a", AliasKind::Folder),
             entry("c", "echo c", AliasKind::Command),
         ];
         sort_for_display(&mut entries);
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(names, vec!["B", "c", "a", "z"]);
+        assert_eq!(names, vec!["B", "c", "a", "z", "s1", "s2"]);
     }
 
     #[test]
@@ -970,14 +1094,19 @@ mod tests {
         let entries = vec![
             entry("gp", "git pull", AliasKind::Command),
             entry("p", "cd ~/x", AliasKind::Folder),
+            entry("srv", "ssh forge@127.0.0.1", AliasKind::Ssh),
         ];
         let rendered = build_table(&entries).to_string();
-        for cell in ["type", "alias", "action", "command", "folder"] {
+        for cell in ["type", "alias", "action", "command", "folder", "ssh"] {
             assert!(rendered.contains(cell), "table should contain '{cell}'");
         }
         let gp_pos = rendered.find("git pull").unwrap();
         let p_pos = rendered.find("cd ~/x").unwrap();
-        assert!(gp_pos < p_pos, "command rows should precede folder rows");
+        let srv_pos = rendered.find("ssh forge@127.0.0.1").unwrap();
+        assert!(
+            gp_pos < p_pos && p_pos < srv_pos,
+            "rows should be ordered command, folder, ssh"
+        );
     }
 
     // -- action validation --
@@ -990,5 +1119,53 @@ mod tests {
         assert!(validate_action("   ").is_err());
         assert!(validate_action("a\nb").is_err());
         assert!(validate_action(r#"echo "a" 'b'"#).is_err());
+    }
+
+    // -- ssh helpers --
+
+    #[test]
+    fn ssh_action_builds_user_at_host() {
+        assert_eq!(ssh_action("forge", "127.0.0.1"), "ssh forge@127.0.0.1");
+        assert_eq!(
+            ssh_action("  forge  ", "  example.com  "),
+            "ssh forge@example.com"
+        );
+        assert_eq!(
+            format_alias_line(&entry(
+                "srv",
+                &ssh_action("forge", "127.0.0.1"),
+                AliasKind::Ssh
+            ))
+            .unwrap(),
+            r#"alias srv="ssh forge@127.0.0.1" #ssh"#
+        );
+    }
+
+    #[test]
+    fn ssh_user_validation() {
+        for good in ["forge", "deploy_user", "user.name", "a-b", "_svc", "u2"] {
+            assert!(validate_ssh_user(good).is_ok(), "{good} should be valid");
+        }
+        for bad in [
+            "", "   ", "for ge", "forge@x", "-forge", "f$", "a'b", "a\"b",
+        ] {
+            assert!(validate_ssh_user(bad).is_err(), "{bad} should be invalid");
+        }
+    }
+
+    #[test]
+    fn ssh_host_validation() {
+        for good in [
+            "127.0.0.1",
+            "example.com",
+            "my-host_1",
+            "2001:db8::1",
+            "host",
+        ] {
+            assert!(validate_ssh_host(good).is_ok(), "{good} should be valid");
+        }
+        for bad in ["", "   ", "host name", "host/path", "$(x)", "a@b", "h'st"] {
+            assert!(validate_ssh_host(bad).is_err(), "{bad} should be invalid");
+        }
     }
 }
