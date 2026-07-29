@@ -1,6 +1,6 @@
 [package]
 name = "alias-management"
-version = "0.3.0"
+version = "0.0.1"
 edition = "2024"
 description = "am - manage personal bash aliases stored in ~/.alias-management"
 

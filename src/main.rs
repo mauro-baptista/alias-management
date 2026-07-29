@@ -14,8 +14,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command as ShellCommand, Stdio};
 use std::sync::LazyLock;
 
-use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use anyhow::{Context, Result, anyhow, bail};
+use clap::{CommandFactory, Parser, Subcommand};
 use comfy_table::presets::UTF8_FULL_CONDENSED;
 use comfy_table::{ContentArrangement, Table};
 use dialoguer::theme::ColorfulTheme;
@@ -111,14 +111,17 @@ Aliases are stored as plain bash with a trailing type marker:\n    \
 alias gp=\"git pull\" #command\n    \
 alias p=\"cd ~/folder/personal\" #folder\n    \
 alias srv=\"ssh forge@127.0.0.1\" #ssh\n\n\
-Run `am` with no arguments to list everything it manages.",
+Run `am list` to see everything it manages; bare `am` shows this help.",
     after_help = "Examples:\n  \
-am                 List managed aliases in a table\n  \
-am new             Interactively create a new alias\n  \
-am delete gp       Delete 'gp' after a confirmation prompt\n  \
-am delete gp -y    Delete 'gp' without asking\n  \
-am delete          Pick a managed alias to delete from a list\n  \
-am install         Copy this binary to a folder on PATH (sudo for system-wide)\n\n\
+am list                  List managed aliases in a table\n  \
+am list -c               Only command aliases (-f folders, -s ssh)\n  \
+am list --search git     Aliases with 'git' in the name or action\n  \
+am new                   Interactively create a new alias\n  \
+am new -f here           Folder alias 'here' for the current directory\n  \
+am new -c gp 'git pull'  Command alias, no prompts\n  \
+am new -s srv forge@127.0.0.1  SSH alias, no prompts\n  \
+am delete gp             Delete 'gp' after a confirmation prompt\n  \
+am install               Copy this binary to a folder on PATH\n\n\
 Files:\n  \
 ~/.alias-management   Managed alias definitions (sourced by bash)\n  \
 ~/.bash_profile       Receives the am shell-integration block on first run"
@@ -131,18 +134,71 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     #[command(
-        about = "Create a new alias interactively",
-        long_about = "Create a new alias interactively.\n\n\
-Asks whether the alias is for a command, a folder or an ssh connection, then \
-prompts for the alias name and the details: the command text, the folder \
-path (defaulting to the current directory), or the ssh user and host (user \
-'forge' and host '127.0.0.1' are stored as `ssh forge@127.0.0.1`). Before \
-saving, the name is checked against aliases already managed here and \
+        about = "Create a new alias (interactive, or via -f/-c/-s shortcuts)",
+        long_about = "Create a new alias.\n\n\
+Fully interactive by default: asks for the type, the name and the details. \
+Every part can also be given up front, and only what is missing is asked:\n\n  \
+am new -f                       folder alias for the current directory, asks the name\n  \
+am new -f here                  folder alias 'here' for the current directory\n  \
+am new -c                       command alias, asks name and command\n  \
+am new -c gp                    command alias 'gp', asks the command\n  \
+am new -c gp 'git pull'         command alias, no prompts\n  \
+am new -s                       ssh alias, asks name, user and host\n  \
+am new -s srv                   ssh alias 'srv', asks user and host\n  \
+am new -s srv forge             ssh alias 'srv', user 'forge', asks the host\n  \
+am new -s srv forge 127.0.0.1   ssh alias, no prompts\n  \
+am new -s srv forge@127.0.0.1   same, in user@host form\n\n\
+Before saving, the name is checked against aliases already managed here and \
 against everything visible in a login shell (binaries, builtins, functions \
 and existing aliases), so an existing name is never shadowed. The new alias \
 is appended to ~/.alias-management."
     )]
-    New,
+    New {
+        #[arg(
+            short = 'f',
+            long = "folder",
+            group = "kind",
+            help = "Folder alias pointing at the current directory"
+        )]
+        folder: bool,
+        #[arg(short = 'c', long = "command", group = "kind", help = "Command alias")]
+        command: bool,
+        #[arg(short = 's', long = "ssh", group = "kind", help = "SSH alias")]
+        ssh: bool,
+        #[arg(
+            value_name = "NAME",
+            help = "Alias name (asked interactively when omitted)"
+        )]
+        name: Option<String>,
+        #[arg(
+            value_name = "DETAILS",
+            help = "With -c: the command; with -s: USER HOST or USER@HOST"
+        )]
+        rest: Vec<String>,
+    },
+    #[command(
+        about = "List managed aliases",
+        long_about = "List managed aliases in a table (type | alias | action), grouped by \
+type — commands, then folders, then ssh — and sorted by alias name within \
+each group.\n\n\
+-c, -f and -s restrict the list to those types (they can be combined), and \
+--search keeps only aliases whose name or action contains the given text — \
+it looks inside folder paths, command lines and ssh targets alike."
+    )]
+    List {
+        #[arg(short = 'f', long = "folder", help = "Show folder aliases")]
+        folder: bool,
+        #[arg(short = 'c', long = "command", help = "Show command aliases")]
+        command: bool,
+        #[arg(short = 's', long = "ssh", help = "Show ssh aliases")]
+        ssh: bool,
+        #[arg(
+            long = "search",
+            value_name = "TEXT",
+            help = "Show only aliases whose name or action contains TEXT"
+        )]
+        search: Option<String>,
+    },
     #[command(
         about = "Delete a managed alias",
         long_about = "Delete a managed alias.\n\n\
@@ -245,8 +301,47 @@ fn run(cli: Cli) -> Result<()> {
     ensure_setup(&home)?;
     let alias_path = alias_file_path(&home);
     match cli.command {
-        None => cmd_list(&alias_path),
-        Some(Cmd::New) => cmd_new(&home, &alias_path),
+        None => {
+            Cli::command()
+                .print_long_help()
+                .context("failed to print help")?;
+            Ok(())
+        }
+        Some(Cmd::List {
+            folder,
+            command,
+            ssh,
+            search,
+        }) => {
+            let mut kinds = Vec::new();
+            if command {
+                kinds.push(AliasKind::Command);
+            }
+            if folder {
+                kinds.push(AliasKind::Folder);
+            }
+            if ssh {
+                kinds.push(AliasKind::Ssh);
+            }
+            cmd_list(&alias_path, &kinds, search.as_deref())
+        }
+        Some(Cmd::New {
+            folder,
+            command,
+            ssh,
+            name,
+            rest,
+        }) => cmd_new(
+            &home,
+            &alias_path,
+            NewOpts {
+                folder,
+                command,
+                ssh,
+                name,
+                rest,
+            },
+        ),
         Some(Cmd::Delete { name, yes }) => cmd_delete(&alias_path, name, yes),
         Some(Cmd::Install { .. }) => unreachable!("handled before setup"),
     }
@@ -496,6 +591,26 @@ fn validate_ssh_user(user: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Interpret the positional details of `am new -s [NAME] ...`: either
+/// `USER HOST`, a combined `USER@HOST`, or fewer pieces (the missing ones
+/// are prompted for later). Validation happens afterwards.
+fn parse_ssh_args(rest: &[String]) -> Result<(Option<String>, Option<String>)> {
+    match rest {
+        [] => Ok((None, None)),
+        [first] => match first.split_once('@') {
+            Some((user, host)) => Ok((Some(user.to_string()), Some(host.to_string()))),
+            None => Ok((Some(first.clone()), None)),
+        },
+        [first, second] => {
+            if first.contains('@') {
+                bail!("'{first}' already contains the host; drop the extra '{second}'");
+            }
+            Ok((Some(first.clone()), Some(second.clone())))
+        }
+        _ => bail!("too many arguments for an ssh alias (am new -s [NAME] [USER[@HOST]] [HOST])"),
+    }
+}
+
 /// Hostnames, IPv4 or IPv6 addresses: letters, digits, '.', ':', '_' and '-'.
 fn validate_ssh_host(host: &str) -> Result<(), String> {
     let trimmed = host.trim();
@@ -717,15 +832,41 @@ fn append_entry(path: &Path, entry: &AliasEntry) -> Result<()> {
 // Commands
 // ---------------------------------------------------------------------------
 
-fn cmd_list(alias_path: &Path) -> Result<()> {
-    let mut entries = load_entries(alias_path)?;
+fn cmd_list(alias_path: &Path, kinds: &[AliasKind], search: Option<&str>) -> Result<()> {
+    let entries = load_entries(alias_path)?;
     if entries.is_empty() {
         println!("No aliases managed yet. Run `am new` to create one.");
         return Ok(());
     }
-    sort_for_display(&mut entries);
-    println!("{}", build_table(&entries));
+    let mut filtered = filter_entries(entries, kinds, search);
+    if filtered.is_empty() {
+        println!("No aliases match the given filters.");
+        return Ok(());
+    }
+    sort_for_display(&mut filtered);
+    println!("{}", build_table(&filtered));
     Ok(())
+}
+
+/// Keep entries matching the kind filter (empty = all kinds) and, when a
+/// search term is given, whose name or action contains it
+/// (case-insensitive) — so it finds text in folder paths, command lines and
+/// ssh targets alike.
+fn filter_entries(
+    entries: Vec<AliasEntry>,
+    kinds: &[AliasKind],
+    search: Option<&str>,
+) -> Vec<AliasEntry> {
+    let needle = search.map(str::to_lowercase);
+    entries
+        .into_iter()
+        .filter(|e| kinds.is_empty() || kinds.contains(&e.kind))
+        .filter(|e| {
+            needle.as_ref().is_none_or(|needle| {
+                e.name.to_lowercase().contains(needle) || e.action.to_lowercase().contains(needle)
+            })
+        })
+        .collect()
 }
 
 fn build_table(entries: &[AliasEntry]) -> Table {
@@ -744,85 +885,158 @@ fn build_table(entries: &[AliasEntry]) -> Table {
     table
 }
 
-fn cmd_new(home: &Path, alias_path: &Path) -> Result<()> {
-    ensure_interactive()?;
+/// Options for `am new`, straight from the CLI: which type was requested
+/// via -f/-c/-s (all false = ask), the alias name, and the type-specific
+/// details (command text, or ssh user/host).
+struct NewOpts {
+    folder: bool,
+    command: bool,
+    ssh: bool,
+    name: Option<String>,
+    rest: Vec<String>,
+}
+
+fn cmd_new(home: &Path, alias_path: &Path, opts: NewOpts) -> Result<()> {
     let theme = ColorfulTheme::default();
 
-    let Some(kind_idx) = as_cancel(
-        Select::with_theme(&theme)
-            .with_prompt("Create an alias for a command, a folder or an ssh connection?")
-            .items(["command", "folder", "ssh"])
-            .default(0)
-            .interact_opt(),
-    )?
-    .flatten() else {
-        println!("Cancelled.");
-        return Ok(());
-    };
-    let kind = match kind_idx {
-        0 => AliasKind::Command,
-        1 => AliasKind::Folder,
-        _ => AliasKind::Ssh,
-    };
-
-    let existing = load_entries(alias_path)?;
-    let name = loop {
-        let input = as_cancel(
-            Input::<String>::with_theme(&theme)
-                .with_prompt("Alias name")
-                .validate_with(|value: &String| -> Result<(), String> {
-                    let v = value.trim();
-                    if v.is_empty() {
-                        return Err("the alias name cannot be empty".into());
-                    }
-                    if !is_valid_alias_name(v) {
-                        return Err("alias names must start with a letter, digit or '_' and \
-                                    contain only letters, digits, '_', '.', '-'"
-                            .into());
-                    }
-                    if existing.iter().any(|e| e.name == v) {
-                        return Err(format!(
-                            "'{v}' is already managed by am; delete it first with: am delete {v}"
-                        ));
-                    }
-                    Ok(())
-                })
-                .interact_text(),
-        )?;
-        let Some(input) = input else {
+    let kind = if opts.folder {
+        AliasKind::Folder
+    } else if opts.command {
+        AliasKind::Command
+    } else if opts.ssh {
+        AliasKind::Ssh
+    } else {
+        ensure_interactive()?;
+        let Some(kind_idx) = as_cancel(
+            Select::with_theme(&theme)
+                .with_prompt("Create an alias for a command, a folder or an ssh connection?")
+                .items(["command", "folder", "ssh"])
+                .default(0)
+                .interact_opt(),
+        )?
+        .flatten() else {
             println!("Cancelled.");
             return Ok(());
         };
-        let candidate = input.trim().to_string();
-        match alias_exists_in_system(&candidate) {
-            Ok(Some(found)) => {
-                eprintln!(
-                    "An alias or command named '{candidate}' already exists: {found}. Pick another name."
+        match kind_idx {
+            0 => AliasKind::Command,
+            1 => AliasKind::Folder,
+            _ => AliasKind::Ssh,
+        }
+    };
+
+    match kind {
+        AliasKind::Folder if !opts.rest.is_empty() => bail!(
+            "folder aliases take only the alias name; the current directory is the target (am new -f [NAME])"
+        ),
+        AliasKind::Ssh if opts.rest.len() > 2 => {
+            bail!("too many arguments for an ssh alias (am new -s [NAME] [USER[@HOST]] [HOST])")
+        }
+        _ => {}
+    }
+
+    let existing = load_entries(alias_path)?;
+    let name = match opts.name {
+        Some(raw) => {
+            let name = raw.trim().to_string();
+            if !is_valid_alias_name(&name) {
+                bail!(
+                    "'{name}' is not a valid alias name: it must start with a letter, digit or '_' and contain only letters, digits, '_', '.', '-'"
                 );
             }
-            Ok(None) => break candidate,
-            Err(e) => {
-                eprintln!("warning: could not run the system-wide alias check ({e:#}); continuing");
-                break candidate;
+            if existing.iter().any(|e| e.name == name) {
+                bail!("'{name}' is already managed by am; delete it first with: am delete {name}");
+            }
+            match alias_exists_in_system(&name) {
+                Ok(Some(found)) => {
+                    bail!("an alias or command named '{name}' already exists: {found}")
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!(
+                        "warning: could not run the system-wide alias check ({e:#}); continuing"
+                    );
+                }
+            }
+            name
+        }
+        None => {
+            ensure_interactive()?;
+            loop {
+                let input = as_cancel(
+                    Input::<String>::with_theme(&theme)
+                        .with_prompt("Alias name")
+                        .validate_with(|value: &String| -> Result<(), String> {
+                            let v = value.trim();
+                            if v.is_empty() {
+                                return Err("the alias name cannot be empty".into());
+                            }
+                            if !is_valid_alias_name(v) {
+                                return Err(
+                                    "alias names must start with a letter, digit or '_' and \
+                                    contain only letters, digits, '_', '.', '-'"
+                                        .into(),
+                                );
+                            }
+                            if existing.iter().any(|e| e.name == v) {
+                                return Err(format!(
+                                    "'{v}' is already managed by am; delete it first with: am delete {v}"
+                                ));
+                            }
+                            Ok(())
+                        })
+                        .interact_text(),
+                )?;
+                let Some(input) = input else {
+                    println!("Cancelled.");
+                    return Ok(());
+                };
+                let candidate = input.trim().to_string();
+                match alias_exists_in_system(&candidate) {
+                    Ok(Some(found)) => {
+                        eprintln!(
+                            "An alias or command named '{candidate}' already exists: {found}. Pick another name."
+                        );
+                    }
+                    Ok(None) => break candidate,
+                    Err(e) => {
+                        eprintln!(
+                            "warning: could not run the system-wide alias check ({e:#}); continuing"
+                        );
+                        break candidate;
+                    }
+                }
             }
         }
     };
 
     let action = match kind {
         AliasKind::Command => {
-            let Some(command) = as_cancel(
-                Input::<String>::with_theme(&theme)
-                    .with_prompt("Command to run")
-                    .validate_with(|value: &String| validate_action(value))
-                    .interact_text(),
-            )?
-            else {
-                println!("Cancelled.");
-                return Ok(());
-            };
-            command.trim().to_string()
+            if !opts.rest.is_empty() {
+                let command = opts.rest.join(" ").trim().to_string();
+                validate_action(&command).map_err(|msg| anyhow!(msg))?;
+                command
+            } else {
+                ensure_interactive()?;
+                let Some(command) = as_cancel(
+                    Input::<String>::with_theme(&theme)
+                        .with_prompt("Command to run")
+                        .validate_with(|value: &String| validate_action(value))
+                        .interact_text(),
+                )?
+                else {
+                    println!("Cancelled.");
+                    return Ok(());
+                };
+                command.trim().to_string()
+            }
+        }
+        AliasKind::Folder if opts.folder => {
+            let cwd = env::current_dir().context("failed to determine the current directory")?;
+            folder_action(&cwd, home)?
         }
         AliasKind::Folder => {
+            ensure_interactive()?;
             let cwd = env::current_dir().context("failed to determine the current directory")?;
             loop {
                 let Some(input) = as_cancel(
@@ -858,25 +1072,46 @@ fn cmd_new(home: &Path, alias_path: &Path) -> Result<()> {
             }
         }
         AliasKind::Ssh => {
-            let Some(user) = as_cancel(
-                Input::<String>::with_theme(&theme)
-                    .with_prompt("SSH user")
-                    .validate_with(|value: &String| validate_ssh_user(value))
-                    .interact_text(),
-            )?
-            else {
-                println!("Cancelled.");
-                return Ok(());
+            let (arg_user, arg_host) = parse_ssh_args(&opts.rest)?;
+            let user = match arg_user {
+                Some(user) => {
+                    validate_ssh_user(&user).map_err(|msg| anyhow!(msg))?;
+                    user
+                }
+                None => {
+                    ensure_interactive()?;
+                    let Some(user) = as_cancel(
+                        Input::<String>::with_theme(&theme)
+                            .with_prompt("SSH user")
+                            .validate_with(|value: &String| validate_ssh_user(value))
+                            .interact_text(),
+                    )?
+                    else {
+                        println!("Cancelled.");
+                        return Ok(());
+                    };
+                    user
+                }
             };
-            let Some(host) = as_cancel(
-                Input::<String>::with_theme(&theme)
-                    .with_prompt("Host")
-                    .validate_with(|value: &String| validate_ssh_host(value))
-                    .interact_text(),
-            )?
-            else {
-                println!("Cancelled.");
-                return Ok(());
+            let host = match arg_host {
+                Some(host) => {
+                    validate_ssh_host(&host).map_err(|msg| anyhow!(msg))?;
+                    host
+                }
+                None => {
+                    ensure_interactive()?;
+                    let Some(host) = as_cancel(
+                        Input::<String>::with_theme(&theme)
+                            .with_prompt("Host")
+                            .validate_with(|value: &String| validate_ssh_host(value))
+                            .interact_text(),
+                    )?
+                    else {
+                        println!("Cancelled.");
+                        return Ok(());
+                    };
+                    host
+                }
             };
             ssh_action(&user, &host)
         }
@@ -973,7 +1208,9 @@ fn ensure_interactive() -> Result<()> {
     if std::io::stdin().is_terminal() {
         Ok(())
     } else {
-        bail!("this command needs an interactive terminal")
+        bail!(
+            "an interactive terminal is needed to ask for the missing details; pass them as command-line arguments instead (see --help)"
+        )
     }
 }
 
@@ -1318,6 +1555,61 @@ mod tests {
         ] {
             assert!(validate_ssh_user(bad).is_err(), "{bad} should be invalid");
         }
+    }
+
+    // -- listing filters --
+
+    #[test]
+    fn filter_by_kind_and_search() {
+        let all = vec![
+            entry("gp", "git pull", AliasKind::Command),
+            entry("gs", "git status", AliasKind::Command),
+            entry("p", "cd ~/proj", AliasKind::Folder),
+            entry("srv", "ssh forge@127.0.0.1", AliasKind::Ssh),
+        ];
+        assert_eq!(filter_entries(all.clone(), &[], None).len(), 4);
+
+        let folders = filter_entries(all.clone(), &[AliasKind::Folder], None);
+        assert_eq!(folders.len(), 1);
+        assert_eq!(folders[0].name, "p");
+
+        let union = filter_entries(all.clone(), &[AliasKind::Command, AliasKind::Ssh], None);
+        assert_eq!(union.len(), 3);
+
+        let by_name = filter_entries(all.clone(), &[], Some("srv"));
+        assert_eq!(by_name.len(), 1);
+        assert_eq!(by_name[0].name, "srv");
+
+        let by_action_ci = filter_entries(all.clone(), &[], Some("GIT"));
+        assert_eq!(by_action_ci.len(), 2);
+
+        let by_ip = filter_entries(all.clone(), &[], Some("127.0"));
+        assert_eq!(by_ip.len(), 1);
+
+        let combined = filter_entries(all, &[AliasKind::Folder], Some("git"));
+        assert!(combined.is_empty());
+    }
+
+    // -- ssh positional args --
+
+    #[test]
+    fn parse_ssh_positional_args() {
+        let v = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(parse_ssh_args(&v(&[])).unwrap(), (None, None));
+        assert_eq!(
+            parse_ssh_args(&v(&["forge"])).unwrap(),
+            (Some("forge".into()), None)
+        );
+        assert_eq!(
+            parse_ssh_args(&v(&["forge", "127.0.0.1"])).unwrap(),
+            (Some("forge".into()), Some("127.0.0.1".into()))
+        );
+        assert_eq!(
+            parse_ssh_args(&v(&["forge@127.0.0.1"])).unwrap(),
+            (Some("forge".into()), Some("127.0.0.1".into()))
+        );
+        assert!(parse_ssh_args(&v(&["forge@h", "x"])).is_err());
+        assert!(parse_ssh_args(&v(&["a", "b", "c"])).is_err());
     }
 
     // -- install helpers --
