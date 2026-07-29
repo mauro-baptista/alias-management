@@ -9,6 +9,7 @@
 use std::env;
 use std::fs;
 use std::io::IsTerminal;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ShellCommand, Stdio};
 use std::sync::LazyLock;
@@ -27,6 +28,10 @@ use regex::Regex;
 
 const ALIAS_FILE_NAME: &str = ".alias-management";
 const PROFILE_FILE_NAME: &str = ".bash_profile";
+
+/// Default system-wide install location for `am install` (standard on both
+/// Linux and macOS).
+const SYSTEM_BIN_DIR: &str = "/usr/local/bin";
 
 const ALIAS_FILE_HEADER: &str = "\
 # Managed by `am` (alias-management).
@@ -112,7 +117,8 @@ am                 List managed aliases in a table\n  \
 am new             Interactively create a new alias\n  \
 am delete gp       Delete 'gp' after a confirmation prompt\n  \
 am delete gp -y    Delete 'gp' without asking\n  \
-am delete          Pick a managed alias to delete from a list\n\n\
+am delete          Pick a managed alias to delete from a list\n  \
+am install         Copy this binary to a folder on PATH (sudo for system-wide)\n\n\
 Files:\n  \
 ~/.alias-management   Managed alias definitions (sourced by bash)\n  \
 ~/.bash_profile       Receives the am shell-integration block on first run"
@@ -156,6 +162,24 @@ run `unalias NAME` or start a new shell."
         name: Option<String>,
         #[arg(short = 'y', long = "yes", help = "Skip the confirmation prompt")]
         yes: bool,
+    },
+    #[command(
+        about = "Copy the am binary to a folder on your PATH",
+        long_about = "Copy the am binary to a folder on your PATH so it is globally \
+available in the terminal.\n\n\
+Without DIR, /usr/local/bin is tried first; when it is not writable, am \
+falls back to ~/.local/bin. Run `sudo am install` to force the system-wide \
+location. With DIR, the binary is installed exactly there.\n\n\
+Installing only places the binary. The shell integration in ~/.bash_profile \
+is set up the first time any other am command runs, so run `am` once \
+afterwards (without sudo)."
+    )]
+    Install {
+        #[arg(
+            value_name = "DIR",
+            help = "Target folder (default: /usr/local/bin, falling back to ~/.local/bin)"
+        )]
+        dir: Option<PathBuf>,
     },
 }
 
@@ -212,12 +236,19 @@ fn main() {
 
 fn run(cli: Cli) -> Result<()> {
     let home = home_dir()?;
+    // `install` runs before the per-user setup on purpose: under sudo, HOME
+    // points at root's home, and setup would write root's dotfiles instead
+    // of the user's. Installing only places the binary.
+    if let Some(Cmd::Install { dir }) = &cli.command {
+        return cmd_install(&home, dir.clone());
+    }
     ensure_setup(&home)?;
     let alias_path = alias_file_path(&home);
     match cli.command {
         None => cmd_list(&alias_path),
         Some(Cmd::New) => cmd_new(&home, &alias_path),
         Some(Cmd::Delete { name, yes }) => cmd_delete(&alias_path, name, yes),
+        Some(Cmd::Install { .. }) => unreachable!("handled before setup"),
     }
 }
 
@@ -482,6 +513,142 @@ fn validate_ssh_host(host: &str) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Self-install
+// ---------------------------------------------------------------------------
+
+/// `am install [DIR]` — copy the running binary into a folder on PATH so it
+/// is globally available. Without DIR, tries the system folder first and
+/// falls back to `~/.local/bin` when it is not writable.
+fn cmd_install(home: &Path, dir: Option<PathBuf>) -> Result<()> {
+    let exe = env::current_exe().context("failed to locate the running am binary")?;
+    let exe = exe.canonicalize().unwrap_or(exe);
+
+    let explicit = dir.is_some();
+    let candidates: Vec<PathBuf> = match dir {
+        Some(dir) => {
+            let cwd = env::current_dir().context("failed to determine the current directory")?;
+            vec![expand_input_path(&dir.to_string_lossy(), home, &cwd)]
+        }
+        None => vec![
+            PathBuf::from(SYSTEM_BIN_DIR),
+            home.join(".local").join("bin"),
+        ],
+    };
+
+    let mut fell_back = false;
+    for (i, target) in candidates.iter().enumerate() {
+        if same_file(&exe, &target.join("am")) {
+            println!(
+                "am is already installed at {} — that is the binary running right now.",
+                target.join("am").display()
+            );
+            return Ok(());
+        }
+        match install_binary_to(&exe, target) {
+            Ok((dest, replaced)) => {
+                if replaced {
+                    println!("Updated {}", dest.display());
+                } else {
+                    println!("Installed am to {}", dest.display());
+                }
+                if fell_back {
+                    println!(
+                        "(for a system-wide install into {SYSTEM_BIN_DIR}, run: sudo am install)"
+                    );
+                }
+                if !dir_on_path(target, env::var("PATH").ok().as_deref()) {
+                    let shown = match target.strip_prefix(home) {
+                        Ok(rest) => format!("$HOME/{}", rest.display()),
+                        Err(_) => target.display().to_string(),
+                    };
+                    println!(
+                        "Note: {} is not on your PATH yet, so the terminal (and the am shell \
+                         wrapper) cannot find it. Add this line to ~/{PROFILE_FILE_NAME} and \
+                         restart your shell:",
+                        target.display()
+                    );
+                    println!("  export PATH=\"{shown}:$PATH\"");
+                }
+                println!(
+                    "If you haven't yet, run `am` once (without sudo) to set up the shell integration."
+                );
+                return Ok(());
+            }
+            Err(e) if is_permission_denied(&e) => {
+                if !explicit && i + 1 < candidates.len() {
+                    eprintln!(
+                        "No write access to {} — trying a user-level folder instead.",
+                        target.display()
+                    );
+                    fell_back = true;
+                } else {
+                    let retry = if explicit {
+                        format!("sudo am install {}", target.display())
+                    } else {
+                        "sudo am install".to_string()
+                    };
+                    return Err(e).with_context(|| {
+                        format!("no write access to {} (try: {retry})", target.display())
+                    });
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    bail!("could not find a writable install folder; try: sudo am install")
+}
+
+/// Copy `exe` into `dir` as `am`: copy to a temp name, mark it executable,
+/// then rename over the destination (atomic, and safe even when replacing a
+/// binary that is currently running). Returns the destination and whether an
+/// existing file was replaced.
+fn install_binary_to(exe: &Path, dir: &Path) -> Result<(PathBuf, bool)> {
+    fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    let dest = dir.join("am");
+    let replaced = dest.exists();
+    let tmp = dir.join(".am.install.tmp");
+    let result = (|| -> Result<()> {
+        fs::copy(exe, &tmp)
+            .with_context(|| format!("failed to copy {} to {}", exe.display(), tmp.display()))?;
+        let mut perms = fs::metadata(&tmp)
+            .with_context(|| format!("failed to stat {}", tmp.display()))?
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&tmp, perms)
+            .with_context(|| format!("failed to mark {} executable", tmp.display()))?;
+        fs::rename(&tmp, &dest)
+            .with_context(|| format!("failed to move the binary into {}", dest.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result.map(|_| (dest, replaced))
+}
+
+/// True when both paths resolve to the same existing file.
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// True when `dir` is one of the entries of the given PATH value.
+fn dir_on_path(dir: &Path, path_var: Option<&str>) -> bool {
+    let Some(path_var) = path_var else {
+        return false;
+    };
+    path_var.split(':').any(|entry| Path::new(entry) == dir)
+}
+
+fn is_permission_denied(err: &anyhow::Error) -> bool {
+    err.chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
 }
 
 // ---------------------------------------------------------------------------
@@ -1151,6 +1318,44 @@ mod tests {
         ] {
             assert!(validate_ssh_user(bad).is_err(), "{bad} should be invalid");
         }
+    }
+
+    // -- install helpers --
+
+    #[test]
+    fn dir_on_path_detection() {
+        let path = Some("/usr/bin:/usr/local/bin:/home/u/.local/bin/");
+        assert!(dir_on_path(Path::new("/usr/local/bin"), path));
+        assert!(dir_on_path(Path::new("/home/u/.local/bin"), path));
+        assert!(!dir_on_path(Path::new("/opt/bin"), path));
+        assert!(!dir_on_path(Path::new("/usr/local/bin"), None));
+    }
+
+    #[test]
+    fn install_binary_copies_replaces_and_marks_executable() {
+        let base = env::temp_dir().join(format!("am-install-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let src_dir = base.join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        let src = src_dir.join("am-src");
+        fs::write(&src, b"binary-v1").unwrap();
+
+        let bin_dir = base.join("bin");
+        let (dest, replaced) = install_binary_to(&src, &bin_dir).unwrap();
+        assert_eq!(dest, bin_dir.join("am"));
+        assert!(!replaced);
+        assert_eq!(fs::read(&dest).unwrap(), b"binary-v1");
+        let mode = fs::metadata(&dest).unwrap().permissions().mode();
+        assert_eq!(mode & 0o111, 0o111, "installed file should be executable");
+        assert!(same_file(&dest, &dest));
+        assert!(!same_file(&src, &dest));
+
+        fs::write(&src, b"binary-v2").unwrap();
+        let (_, replaced) = install_binary_to(&src, &bin_dir).unwrap();
+        assert!(replaced);
+        assert_eq!(fs::read(&dest).unwrap(), b"binary-v2");
+
+        fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
