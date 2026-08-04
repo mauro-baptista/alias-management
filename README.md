@@ -259,8 +259,16 @@ Two GitHub Actions workflows live in `.github/workflows/`:
 
   ```bash
   git tag v0.0.1
-  git push origin v0.0.1
+  git push origin v0.0.1   # pushing the tag is what starts the release
   ```
+
+  The tag must match the `version` in `Cargo.toml` — the workflow checks
+  this first and stops with a clear message otherwise, so a release can
+  never ship binaries whose `am --version` disagrees with the release
+  name. To release a new version: bump `Cargo.toml`, commit, then tag with
+  the matching `v` prefix. Tags with a suffix (`v0.1.0-rc.1`) are
+  published as prereleases, and re-pushing an existing tag refreshes that
+  release's files instead of failing.
 
 ## Behavior notes and limitations
 

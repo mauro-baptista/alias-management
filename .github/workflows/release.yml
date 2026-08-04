@@ -20,8 +20,30 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Runs on every event so `build` never gets skipped by a skipped
+  # dependency; the check itself only applies to tag pushes.
+  verify:
+    name: Verify tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compare tag with package version
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          if [ "$TAG" != "v$version" ]; then
+            echo "::error::Tag $TAG does not match the version in Cargo.toml ($version)."
+            echo "Set version = \"${TAG#v}\" in Cargo.toml and commit it, or tag v$version instead."
+            exit 1
+          fi
+          echo "Tag $TAG matches Cargo.toml version $version."
+
   build:
     name: Build ${{ matrix.artifact }}
+    needs: verify
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -98,11 +120,15 @@ jobs:
           TAG: ${{ github.ref_name }}
           REPO: ${{ github.repository }}
         run: |
+          # Tags carrying a suffix (v1.0.0-rc.1) are published as prereleases.
+          extra=""
+          case "$TAG" in *-*) extra="--prerelease" ;; esac
           if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            # Re-running a tag refreshes the assets of the existing release.
             gh release upload "$TAG" dist/* --clobber --repo "$REPO"
           else
             gh release create "$TAG" dist/* \
               --repo "$REPO" \
               --title "am $TAG" \
-              --generate-notes
+              --generate-notes $extra
           fi
