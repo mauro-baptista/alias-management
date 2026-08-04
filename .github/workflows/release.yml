@@ -4,10 +4,17 @@ name: Release
 #   git tag v0.0.1 && git push origin v0.0.1
 # This builds the am binary for Linux and macOS and attaches the files to a
 # GitHub release, ready to download and drop into a bin folder.
+#
+# The same builds also run on every pull request, so a change that breaks a
+# release build is caught in review rather than at tagging time. Pull
+# requests only build (the binaries are attached to the run as downloadable
+# artifacts); publishing a release happens on tags alone.
 
 on:
   push:
     tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -71,6 +78,8 @@ jobs:
   release:
     name: Publish GitHub release
     needs: build
+    # Only tags publish; pull-request runs stop after the build job.
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write

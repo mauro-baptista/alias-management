@@ -249,10 +249,13 @@ Two GitHub Actions workflows live in `.github/workflows/`:
 - **CI** (`ci.yml`) runs on every pull request and on pushes to `main`:
   `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test` and a
   release build, on both Ubuntu and macOS.
-- **Release** (`release.yml`) runs when a `v*` tag is pushed. It builds the
-  binaries for all three platforms (the Linux one statically against musl,
-  so it runs on any x86_64 distro), generates `SHA256SUMS`, and publishes
-  everything as a GitHub release:
+- **Release** (`release.yml`) builds the binaries for all three platforms
+  (the Linux one statically against musl, so it runs on any x86_64 distro).
+  It also runs on every pull request, so a change that breaks a release
+  build is caught in review — those runs stop after the build and attach
+  the binaries to the run as downloadable artifacts. Pushing a `v*` tag
+  additionally generates `SHA256SUMS` and publishes everything as a GitHub
+  release:
 
   ```bash
   git tag v0.0.1
