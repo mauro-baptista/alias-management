@@ -1,5 +1,7 @@
 # am — Alias Manager
 
+[![CI](https://github.com/mauro-baptista/alias-management/actions/workflows/ci.yml/badge.svg)](https://github.com/mauro-baptista/alias-management/actions/workflows/ci.yml)
+
 `am` is a small command-line tool (a single Rust binary) that manages your
 personal bash aliases in one dedicated file, `~/.alias-management`. It works
 on **Linux and macOS** with bash. It never touches aliases defined anywhere
@@ -30,9 +32,12 @@ It manages three kinds of aliases:
 ### Option 1 — just download the `am` file and put it in your bin folder
 
 `am` is a single self-contained executable — no runtime, no libraries, no
-config. To use it system-wide, all you need to do is download the `am`
-binary built for your platform and put it in a folder on your `PATH`. The
-easiest way is to let it install itself:
+config. Grab the file for your platform from the
+[Releases page](https://github.com/mauro-baptista/alias-management/releases)
+— `am-linux-x86_64` (fully static), `am-macos-arm64` (Apple Silicon) or
+`am-macos-x86_64` (Intel), with a `SHA256SUMS` file to verify — rename it
+to `am`, and put it in a folder on your `PATH`. The easiest way is to let
+it install itself:
 
 ```bash
 chmod +x am        # make the downloaded file executable
@@ -236,6 +241,23 @@ changes up on the next run.
   `~/.bash_profile`. If your aliases only show up after `bash -l`, add
   `source ~/.bash_profile` to your `~/.bashrc` (am deliberately never
   edits `~/.bashrc` itself).
+
+## Development, CI and releases
+
+Two GitHub Actions workflows live in `.github/workflows/`:
+
+- **CI** (`ci.yml`) runs on every pull request and on pushes to `main`:
+  `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test` and a
+  release build, on both Ubuntu and macOS.
+- **Release** (`release.yml`) runs when a `v*` tag is pushed. It builds the
+  binaries for all three platforms (the Linux one statically against musl,
+  so it runs on any x86_64 distro), generates `SHA256SUMS`, and publishes
+  everything as a GitHub release:
+
+  ```bash
+  git tag v0.0.1
+  git push origin v0.0.1
+  ```
 
 ## Behavior notes and limitations
 
